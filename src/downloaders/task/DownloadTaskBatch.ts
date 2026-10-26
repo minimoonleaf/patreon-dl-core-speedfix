@@ -1,3 +1,4 @@
+import { SPEEDFIX_LABEL } from '../../utils/SpeedFixVersion.js';
 import Bottleneck from 'bottleneck';
 import {type DownloadTaskError, type DownloadProgress, type DownloadTaskStatus, type DownloadTaskSkipReason, type IDownloadTask} from './DownloadTask.js';
 import type DownloadTask from './DownloadTask.js';
@@ -47,6 +48,10 @@ export default class DownloadTaskBatch extends EventEmitter implements IDownload
   #destroyPromise: Promise<void> | null;
   #destroyed: boolean;
   #aborted: boolean;
+  #speedFixV242StartedAt: number | null = null;
+  #speedFixV242Reported = false;
+  #speedFixV242ConflictMs = 0;
+  #speedFixV242ConflictGroups = 0;
 
   constructor(params: DownloadTaskBatchParams) {
     super();
@@ -132,6 +137,8 @@ export default class DownloadTaskBatch extends EventEmitter implements IDownload
       return this.#startPromise;
     }
 
+    this.#speedFixV242StartedAt = Date.now();
+    this.#speedFixV242Reported = false;
     this.#startPromise = new Promise<void>((resolve) => {
       this.#startingCallback = () => {
         this.#startPromise = null;
@@ -153,26 +160,60 @@ export default class DownloadTaskBatch extends EventEmitter implements IDownload
   }
 
   #resolveConflictingDestPaths() {
+    // === SpeedFix v2.4.2: index collisions and preserve original task ordering ===
+    const speedFixStarted = Date.now();
     const tasks = this.#tasks.filter((task) => !task.doa && task.resolvedDestPath);
     if (tasks.length === 0) {
+      this.#speedFixV242ConflictMs = Date.now() - speedFixStarted;
+      this.#speedFixV242ConflictGroups = 0;
       return;
     }
     this.log('debug', `Resolve conflicting dest paths (${tasks.length} tasks)`);
+    const byPath = new Map<string, Set<DownloadTask>>();
+    const positions = new Map<DownloadTask, number>();
+    for (let i = 0; i < tasks.length; i++) {
+      const current = tasks[i];
+      positions.set(current, i);
+      const key = current.resolvedDestPath!;
+      let group = byPath.get(key);
+      if (!group) { group = new Set(); byPath.set(key, group); }
+      group.add(current);
+    }
+    let conflictGroups = 0;
     for (const t of tasks) {
-      const dup = tasks.filter((task) => task.resolvedDestPath === t.resolvedDestPath);
-      if (dup.length > 1) {
-        this.log('debug', `${dup.length} tasks have same dest path "${t.resolvedDestPath}"`);
-        dup.forEach((task) => {
-          task.addSuffixToDestPath(` - ${task.srcEntity.id}`);
-          this.log('debug', `(#${this.id}.${task.id}): Override dest path -> "${task.resolvedDestPath}"`);
-        });
+      const group = byPath.get(t.resolvedDestPath!);
+      if (!group || group.size <= 1) continue;
+      const dup = Array.from(group).sort((a, b) => positions.get(a)! - positions.get(b)!);
+      conflictGroups++;
+      this.log('debug', `${dup.length} tasks have same dest path "${t.resolvedDestPath}"`);
+      for (const collision of dup) {
+        const oldPath = collision.resolvedDestPath!;
+        const oldGroup = byPath.get(oldPath);
+        if (oldGroup) {
+          oldGroup.delete(collision);
+          if (oldGroup.size === 0) byPath.delete(oldPath);
+        }
+        collision.addSuffixToDestPath(` - ${collision.srcEntity.id}`);
+        const newPath = collision.resolvedDestPath!;
+        let newGroup = byPath.get(newPath);
+        if (!newGroup) { newGroup = new Set(); byPath.set(newPath, newGroup); }
+        newGroup.add(collision);
+        this.log('debug', `(#${this.id}.${collision.id}): Override dest path -> "${collision.resolvedDestPath}"`);
       }
     }
+    this.#speedFixV242ConflictMs = Date.now() - speedFixStarted;
+    this.#speedFixV242ConflictGroups = conflictGroups;
+    // === End SpeedFix v2.4.2 collision index ===
   }
 
   #checkAndCallbackBatchComplete() {
     if (this.allTasksEnded()) {
       this.emit('complete', {});
+      if (!this.#speedFixV242Reported && this.#speedFixV242StartedAt !== null) {
+        this.#speedFixV242Reported = true;
+        const elapsed = Date.now() - this.#speedFixV242StartedAt;
+        this.log('info', `${SPEEDFIX_LABEL} Download batch #${this.id}: elapsed ${elapsed} ms; ${this.#tasks.length} tasks; conflict scan ${this.#speedFixV242ConflictMs} ms; conflict groups ${this.#speedFixV242ConflictGroups}; GET limiter unchanged`);
+      }
       if (this.#startingCallback) {
         this.#startingCallback();
       }

@@ -60,6 +60,8 @@ export default class Fetcher {
   #fsHelper: FSHelper;
   #proxyAgent?: Dispatcher;
   #userAgent: string;
+  #speedFixHeadCache = new Map<string, { time: number; response: Response }>();
+  public __speedFixV231HeadMetrics = { hits: 0, misses: 0 };
 
   constructor(config: DownloaderConfig<any>, logger?: Logger | null) {
     this.#cookie = config.cookie;
@@ -164,7 +166,48 @@ export default class Fetcher {
     }
 
     try {
-      const res = await fetch(request, { signal: internalAbortController.signal, dispatcher: this.#proxyAgent });
+      // === SpeedFix v2.4.2 (based on v2.3.1): 20-second, 64-entry HEAD response cache ===
+      if (signal?.aborted || internalAbortController.signal.aborted) {
+        throw new Error('HEAD preparation aborted');
+      }
+      const speedFixKey = JSON.stringify([url, Boolean(setReferer)]);
+      const speedFixCached = this.#speedFixHeadCache.get(speedFixKey);
+      let res: Response;
+      if (speedFixCached && Date.now() - speedFixCached.time < 20000) {
+        this.__speedFixV231HeadMetrics.hits++;
+        res = speedFixCached.response;
+      }
+      else {
+        if (speedFixCached) this.#speedFixHeadCache.delete(speedFixKey);
+        this.__speedFixV231HeadMetrics.misses++;
+        res = await fetch(request, { signal: internalAbortController.signal, dispatcher: this.#proxyAgent });
+        if (res.status === 200 && !signal?.aborted && !internalAbortController.signal.aborted) {
+          this.#speedFixHeadCache.set(speedFixKey, { time: Date.now(), response: res });
+          while (this.#speedFixHeadCache.size > 64) {
+            const oldest = this.#speedFixHeadCache.keys().next().value;
+            if (oldest === undefined) break;
+            this.#speedFixHeadCache.delete(oldest);
+          }
+        }
+      }
+      // Propagate HEAD 429 status and Retry-After to the bounded per-batch retry loop.
+      if (res.status === 429) {
+        const rawRetryAfter = res.headers?.get('retry-after');
+        let retryAfterMs: number | null = null;
+        if (rawRetryAfter) {
+          const seconds = Number(rawRetryAfter);
+          if (Number.isFinite(seconds) && seconds >= 0) {
+            retryAfterMs = Math.ceil(seconds * 1000);
+          }
+          else {
+            const retryDate = Date.parse(rawRetryAfter);
+            if (Number.isFinite(retryDate)) retryAfterMs = Math.max(0, retryDate - Date.now());
+          }
+        }
+        const throttled = Object.assign(new Error('429 - Too Many Requests'), { status: 429, retryAfterMs });
+        throw throttled;
+      }
+      // === End SpeedFix v2.4.2 HEAD cache / 429 ===
 
       if (this.#assertResponseOK(res, url, request.method, false)) {
         const destFilename = destFilenameResolver.resolve(res);

@@ -73,7 +73,7 @@ export interface DownloaderFileLoggerInit {
 
 export default class FileLogger<T extends FileLoggerType = FileLoggerType.Downloader> extends ConsoleLogger {
 
-  protected config: FileLoggerConfig<T>;
+  declare protected config: FileLoggerConfig<T>;
   #fileExistsAction: FileLoggerConfig<T>['fileExistsAction'];
   #stream: fs.WriteStream | null;
   #firstRun: boolean;

@@ -1,3 +1,4 @@
+import { SPEEDFIX_LABEL } from '../utils/SpeedFixVersion.js';
 import URLHelper from '../utils/URLHelper.js';
 import Downloader, { type DownloaderConfig, type DownloaderStartParams } from './Downloader.js';
 import PostParser from '../parsers/PostParser.js';
@@ -115,6 +116,18 @@ export default class PostDownloader extends Downloader<Post> {
       let downloaded = 0;
       let skippedUnviewable = 0;
       let skippedRedundant = 0;
+      // SpeedFix v2.5.0: counters for safe pre-refresh post skips.
+      let speedFixFastSkipped = 0;
+      let speedFixIncompleteListMetadata = 0;
+      // Breakdown of missing list fields; diagnostic only, does not relax skip criteria.
+      let speedFixV252NoRawPost = 0;
+      let speedFixV252NoViewability = 0;
+      let speedFixV252NoEditedAt = 0;
+      let speedFixV252NoCommentCount = 0;
+      let speedFixV253CommentlessCandidates = 0;
+      let speedFixV253CommentlessFastSkips = 0;
+      let speedFixIndividualRefreshes = 0;
+      const speedFixFastSkipEnabled = process.env.SPEEDFIX_FAST_SKIP !== '0';
       let skippedUnmetMediaTypeCriteria = 0;
       let skippedNotInTier = 0;
       let skippedPublishDateOutOfRange = 0;
@@ -122,6 +135,10 @@ export default class PostDownloader extends Downloader<Post> {
       let stopConditionMet = false;
       const savedCollectionIds: string[] = [];
       const postsParser = new PostParser(this.fetcher, this.logger);
+      // SpeedFix v2.5.1: report Fast Skip progress at each fetched page.
+      let speedFixV251PageCount = 0;
+      // v2.5.4: elapsed wall time per processed page (API fetch + local processing).
+      let speedFixV254PageStartedAt = Date.now();
       while (postsFetcher.hasNext()) {
         const { list, aborted, error } = await postsFetcher.next();
         if (!list || aborted) {
@@ -165,7 +182,67 @@ export default class PostDownloader extends Downloader<Post> {
             }
           }
 
+          // === SpeedFix v2.5.0: fast unchanged-post skip before individual API refresh ===
+          // The upstream downloader refreshes every post to renew expiring media links,
+          // even when the post's status cache says nothing has changed. For unchanged
+          // posts, those refreshed media links will not be used. Only bypass the refresh
+          // if the freshly fetched paginated API response explicitly contains ALL of
+          // the attributes needed by StatusCache; missing fields must use upstream flow.
+          if (speedFixFastSkipEnabled && this.config.useStatusCache) {
+            const speedFixRawData = (_post.raw as { data?: unknown }).data;
+            const speedFixSourcePost = Array.isArray(speedFixRawData)
+              ? speedFixRawData.find((entry: any) => entry?.type === 'post' && entry.id === _post.id)
+              : null;
+            const speedFixAttrs = speedFixSourcePost?.attributes;
+            // SpeedFix v2.5.3: comments-disabled jobs may use list posts
+            // without comment_count. All other metadata and the full original
+            // StatusCache.validate() outcome remain mandatory.
+            const speedFixV253CommentlessCandidate =
+              this.config.include.comments === false &&
+              process.env.SPEEDFIX_STRICT_COMMENT_COUNT !== '1' &&
+              (speedFixAttrs?.comment_count === undefined || speedFixAttrs?.comment_count === null);
+            const speedFixHasFreshMetadata = speedFixAttrs &&
+              typeof speedFixAttrs.current_user_can_view === 'boolean' &&
+              (typeof speedFixAttrs.edited_at === 'string' || speedFixAttrs.edited_at === null) &&
+              ((Number.isInteger(speedFixAttrs.comment_count) && speedFixAttrs.comment_count >= 0) ||
+                speedFixV253CommentlessCandidate);
+            if (speedFixHasFreshMetadata) {
+              if (speedFixV253CommentlessCandidate) speedFixV253CommentlessCandidates++;
+              const speedFixPostDirs = this.fsHelper.getPostDirs(_post);
+              const speedFixStatusCache = StatusCache.getInstance(this.config, speedFixPostDirs.statusCache, this.logger);
+              const speedFixValidation = speedFixStatusCache.validate(_post, speedFixPostDirs.root, this.config);
+              if (!speedFixValidation.invalidated) {
+                // Keep the same targetBegin / targetEnd, counters and stop conditions
+                // as the original post-refresh skip branch.
+                this.emit('targetBegin', { target: _post });
+                this.log('info', `Skipped downloading post #${_post.id}: already downloaded and nothing has changed since last download`);
+                this.emit('targetEnd', {
+                  target: _post,
+                  isSkipped: true,
+                  skipReason: TargetSkipReason.AlreadyDownloaded,
+                  skipMessage: 'Target already downloaded and nothing has changed since last download'
+                });
+                skippedRedundant++;
+                speedFixFastSkipped++;
+                if (speedFixV253CommentlessCandidate) speedFixV253CommentlessFastSkips++;
+                if (this.config.stopOn === 'postPreviouslyDownloaded' ||
+                  this.config.stopOn === 'previouslyDownloaded') {
+                  stopConditionMet = true;
+                }
+                continue;
+              }
+            }
+            else {
+              speedFixIncompleteListMetadata++;
+              if (!speedFixSourcePost || !speedFixAttrs) speedFixV252NoRawPost++;
+              if (typeof speedFixAttrs?.current_user_can_view !== 'boolean') speedFixV252NoViewability++;
+              if (typeof speedFixAttrs?.edited_at !== 'string' && speedFixAttrs?.edited_at !== null) speedFixV252NoEditedAt++;
+              if (!Number.isInteger(speedFixAttrs?.comment_count) || speedFixAttrs.comment_count < 0) speedFixV252NoCommentCount++;
+            }
+          }
+          // === End SpeedFix v2.5.0 ===
           if (this.#isFetchingMultiplePosts(postFetch)) {
+            speedFixIndividualRefreshes++;
             // Refresh to ensure media links have not expired
             this.log('debug', `Refresh post #${_post.id}`);
             const postURL = URLHelper.constructPostsAPIURL({ postId: _post.id });
@@ -256,6 +333,11 @@ export default class PostDownloader extends Downloader<Post> {
           }
         }
 
+        // SpeedFix v2.5.1: counters are cumulative; no added network requests.
+        speedFixV251PageCount++;
+        this.log('info', `${SPEEDFIX_LABEL} Page ${speedFixV251PageCount}: fast skips ${speedFixFastSkipped}; individual refreshes ${speedFixIndividualRefreshes}; incomplete list metadata ${speedFixIncompleteListMetadata}; missing raw ${speedFixV252NoRawPost}; viewability ${speedFixV252NoViewability}; edited_at ${speedFixV252NoEditedAt}; comment_count ${speedFixV252NoCommentCount}; commentless candidates ${speedFixV253CommentlessCandidates}; commentless fast skips ${speedFixV253CommentlessFastSkips}`);
+        this.log('info', `${SPEEDFIX_LABEL} Page ${speedFixV251PageCount} wall time: ${Date.now()-speedFixV254PageStartedAt} ms (fetch + parse + status + collection I/O)`);
+        speedFixV254PageStartedAt = Date.now();
         if (stopConditionMet) {
           break;
         }
@@ -309,6 +391,7 @@ export default class PostDownloader extends Downloader<Post> {
         const skippedStr = skippedStrParts.length > 0 ? ` (skipped: ${skippedStrParts.join(', ')})` : '';
         endMessage = `Total ${downloaded} / ${postsFetcher.getTotal()} posts processed${skippedStr}`;
         this.log('info', endMessage);
+        this.log('info', `${SPEEDFIX_LABEL} Fast unchanged-post skips: ${speedFixFastSkipped}; individual refreshes: ${speedFixIndividualRefreshes}; missing list metadata: ${speedFixIncompleteListMetadata}; missing raw ${speedFixV252NoRawPost}; viewability ${speedFixV252NoViewability}; edited_at ${speedFixV252NoEditedAt}; comment_count ${speedFixV252NoCommentCount}; commentless candidates ${speedFixV253CommentlessCandidates}; commentless fast skips ${speedFixV253CommentlessFastSkips}; media GET settings unchanged`);
       }
       this.emit('end', { aborted: false, message: endMessage });
     }

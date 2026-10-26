@@ -1,3 +1,4 @@
+import { SPEEDFIX_LABEL } from '../utils/SpeedFixVersion.js';
 import fs from 'fs';
 import { EventEmitter } from 'events';
 import deepFreeze from 'deep-freeze';
@@ -17,6 +18,7 @@ import FilenameFormatHelper from '../utils/FilenameFormatHelper.js';
 import { type Downloadable } from '../entities/Downloadable.js';
 import { generateCampaignSummary } from './templates/CampaignInfo.js';
 import path from 'path';
+import Bottleneck from 'bottleneck';
 import URLHelper from '../utils/URLHelper.js';
 import ffmpeg from 'fluent-ffmpeg';
 import InnertubeLoader from '../utils/yt/InnertubeLoader.js';
@@ -116,7 +118,23 @@ export default abstract class Downloader<T extends DownloaderType> extends Event
       logger: this.logger
     });
 
+    // SpeedFix v2.5.1: time *active* tasks, excluding queued limiter wait.
+    const speedFixV251TaskStartedAt = new WeakMap<object, number>();
+    // v2.5.3: active skip / error / abort timings; queued time is excluded.
+    const speedFixV253SkipTiming = { observed: 0, slow: 0, totalMs: 0, maxMs: 0, maxTaskId: '' };
+    const speedFixV253FinishTask = (task: object, outcome: string) => {
+      const start = speedFixV251TaskStartedAt.get(task);
+      speedFixV251TaskStartedAt.delete(task);
+      if (start === undefined) return undefined;
+      const elapsed = Date.now() - start;
+      if (elapsed >= 3000) {
+        const t = task as { id: string | number; srcEntity: { type: string; id: string | number } };
+        this.log('info', `${SPEEDFIX_LABEL} Slow ${outcome}: ${elapsed} ms; type ${t.srcEntity.type}; item #${t.srcEntity.id}; batch #${batch.id}.${t.id}; active task time (includes destination I/O)`);
+      }
+      return elapsed;
+    };
     batch.on('taskStart', ({task}) => {
+      speedFixV251TaskStartedAt.set(task, Date.now());
       const retryOrBeginStr = task.retryCount > 0 ? 'retry' : 'begin';
       const isExternal = task instanceof ExternalDownloaderTask;
       const destStr = isExternal ? ' -> Unknown destination (external process)' : task.resolvedDestFilename ? ` -> ${task.resolvedDestFilename}` : '';
@@ -128,22 +146,43 @@ export default abstract class Downloader<T extends DownloaderType> extends Event
     });
 
     batch.on('taskComplete', ({task}) => {
+      // SpeedFix v2.5.1: includes network transfer and destination I/O; not pure GET latency.
+      const speedFixV251StartedAt = speedFixV251TaskStartedAt.get(task);
+      if (speedFixV251StartedAt !== undefined) {
+        const speedFixV251Elapsed = Date.now() - speedFixV251StartedAt;
+        if (speedFixV251Elapsed >= 3000) {
+          this.log('info', `${SPEEDFIX_LABEL} Slow task: ${speedFixV251Elapsed} ms; type ${task.srcEntity.type}; item #${task.srcEntity.id}; batch #${batch.id}.${task.id}; network + destination I/O`);
+        }
+        speedFixV251TaskStartedAt.delete(task);
+      }
       const isExternal = task instanceof ExternalDownloaderTask;
       const destStr = isExternal ? ': Unknown destination (external process)' : task.resolvedDestPath ? `: "${task.resolvedDestPath}"` : '';
       this.log('info', `Download complete (${__getDownloadIdString(task, batch)})${destStr}`);
     });
 
     batch.on('taskError', ({error, willRetry}) => {
+      speedFixV253FinishTask(error.task, willRetry ? 'retry/error' : 'error');
       const { task, cause, message } = error;
       const retryStr = willRetry ? '- will retry' : '';
       this.log('error', `Download error (${__getDownloadIdString(task, batch)}):`, cause || message, `(${task.src})`, retryStr);
     });
 
     batch.on('taskAbort', ({task}) => {
+      speedFixV253FinishTask(task, 'abort');
       this.log('warn', `Download aborted (${__getDownloadIdString(task, batch)})`);
     });
 
     batch.on('taskSkip', ({task, reason}) => {
+      const speedFixV253SkipMs = speedFixV253FinishTask(task, 'skip');
+      if (speedFixV253SkipMs !== undefined) {
+        speedFixV253SkipTiming.observed++;
+        speedFixV253SkipTiming.totalMs += speedFixV253SkipMs;
+        if (speedFixV253SkipMs >= 3000) speedFixV253SkipTiming.slow++;
+        if (speedFixV253SkipMs > speedFixV253SkipTiming.maxMs) {
+          speedFixV253SkipTiming.maxMs = speedFixV253SkipMs;
+          speedFixV253SkipTiming.maxTaskId = `#${batch.id}.${task.id}`;
+        }
+      }
       this.log('warn', `Download skipped (${__getDownloadIdString(task, batch)}): ${reason.message}`);
     });
 
@@ -171,6 +210,11 @@ export default abstract class Downloader<T extends DownloaderType> extends Event
     */
 
     batch.on('complete', () => {
+      // Avoid noisy logging for a single fast-skipped collection thumbnail.
+      if (speedFixV253SkipTiming.observed >= 20 || speedFixV253SkipTiming.slow > 0) {
+        const s = speedFixV253SkipTiming;
+        this.log('info', `${SPEEDFIX_LABEL} Skip timing batch #${batch.id}: ${s.observed} observed; mean ${Math.round(s.totalMs / s.observed)} ms; slow >=3s ${s.slow}; max ${s.maxMs} ms (${s.maxTaskId})`);
+      }
       const total = batch.getTasks().length;
       const completed = batch.getTasks('completed').length;
       const error = batch.getTasks('error').length;
@@ -205,42 +249,160 @@ export default abstract class Downloader<T extends DownloaderType> extends Event
         this.log('warn', `No items in ${targetName}`);
         continue;
       }
-      let ensureDirs: string[] = [];
-      for (const tt of target) {
-        try {
-          const tasks = await DownloadTaskFactory.createFromDownloadable({
-            config: this.config,
-            dirs,
-            item: tt,
-            src,
-            fetcher: this.fetcher,
-            fileExistsAction: task.fileExistsAction,
-            isAttachment: task.isAttachment,
-            limiter: batch.limiter,
-            signal,
-            logger: this.logger
-          });
-
-          if (signal?.aborted) {
-            return { batch, errorCount: failedCreateTaskCount };
+      // === SpeedFix v2.4.2: preparation only; media GET limiter remains unchanged ===
+      const speedFixStart = Date.now();
+      const speedFixHeadCacheBefore = { ...this.fetcher.__speedFixV231HeadMetrics };
+      const speedFixWorkers = Math.max(1, Math.min(4, Number(this.config.request.maxConcurrent) || 1));
+      // SpeedFix v2.5.2: cautiously reduce HEAD base pacing (75 -> 60 ms).
+      // Optional environment override 50..150 ms; existing 429 backoff is retained.
+      const speedFixConfiguredGap = Number(process.env.SPEEDFIX_HEAD_GAP_MS);
+      const speedFixBaseGap = process.env.SPEEDFIX_HEAD_GAP_MS !== undefined &&
+        Number.isFinite(speedFixConfiguredGap)
+          ? Math.round(Math.max(50, Math.min(150, speedFixConfiguredGap)))
+          : 60;
+      let speedFixGap = speedFixBaseGap;
+      const speedFixPreparationLimiter = new Bottleneck({
+        maxConcurrent: speedFixWorkers,
+        minTime: speedFixGap
+      });
+      type SpeedFixTaskResult = Awaited<ReturnType<typeof DownloadTaskFactory.createFromDownloadable>>;
+      const speedFixResults: Array<{
+        tt: Downloadable;
+        tasks?: SpeedFixTaskResult;
+        error?: unknown;
+        ms: number;
+      } | undefined> = new Array(target.length);
+      const speedFixOriginalResolver = this.fetcher.resolveDestFilePath;
+      const speedFixHadOwnResolver = Object.prototype.hasOwnProperty.call(this.fetcher, 'resolveDestFilePath');
+      const speedFixBoundResolver = speedFixOriginalResolver.bind(this.fetcher);
+      let speedFixNextIndex = 0;
+      let speedFixCooldownUntil = 0;
+      let speedFix429Streak = 0;
+      let speedFixLast429 = 0;
+      let speedFixSuccessesAfter429 = 0;
+      let speedFixHeadAttempts = 0;
+      let speedFix429Count = 0;
+      let speedFixSlowestHead: { ms: number } | null = null;
+      const speedFixPause = async (ms: number, abortSignal?: AbortSignal) => {
+        if (abortSignal?.aborted) throw new Error('HEAD preparation aborted');
+        if (ms <= 0) return;
+        await new Promise<void>((resolve, reject) => {
+          let timer: ReturnType<typeof setTimeout>;
+          const cleanup = () => {
+            clearTimeout(timer);
+            abortSignal?.removeEventListener('abort', onAbort);
+          };
+          const onAbort = () => {
+            cleanup();
+            reject(new Error('HEAD preparation aborted'));
+          };
+          timer = setTimeout(() => { cleanup(); resolve(); }, ms);
+          abortSignal?.addEventListener('abort', onAbort, { once: true });
+          if (abortSignal?.aborted) onAbort();
+        });
+      };
+      // This per-batch wrapper also honors Patreon Retry-After on HEAD 429.
+      // Type assertion is localized: we temporarily replace a generic instance method.
+      (this.fetcher as any).resolveDestFilePath = async (params: Parameters<Fetcher['resolveDestFilePath']>[0]) => {
+        const max429Retries = Math.max(0, Math.min(10, Number(this.config.request.maxRetries) || 0));
+        for (let attempt = 0; attempt <= max429Retries; attempt++) {
+          while (Date.now() < speedFixCooldownUntil) {
+            await speedFixPause(Math.min(speedFixCooldownUntil - Date.now(), 60000), params?.signal || signal);
           }
-
-          // Filter out tasks that are DOA (errors that occurred in DownloadTask.create())
-          for (const task of tasks) {
-            if (task.doa) {
-              this.log('error', `Failed to create download task for item #${tt.id} in ${targetName}:`, task.doa.msg, task.doa.cause);
+          if (params?.signal?.aborted || signal?.aborted) throw new Error('HEAD preparation aborted');
+          const started = Date.now();
+          speedFixHeadAttempts++;
+          try {
+            const result = await speedFixBoundResolver(params);
+            const elapsed = Date.now() - started;
+            if (!speedFixSlowestHead || elapsed > speedFixSlowestHead.ms) speedFixSlowestHead = { ms: elapsed };
+            if (speedFixLast429 > 0) {
+              speedFixSuccessesAfter429++;
+              if (speedFixGap > speedFixBaseGap && Date.now() - speedFixLast429 >= 60000 && speedFixSuccessesAfter429 >= 30) {
+                speedFixGap = Math.max(speedFixBaseGap, speedFixGap - 25);
+                await speedFixPreparationLimiter.updateSettings({ minTime: speedFixGap });
+                speedFixSuccessesAfter429 = 0;
+                speedFix429Streak = 0;
+                this.log('info', `${SPEEDFIX_LABEL} HEAD rate recovered: gap ${speedFixGap} ms`);
+              }
+            }
+            return result;
+          }
+          catch (caught: unknown) {
+            const error = caught as Error & { status?: number; retryAfterMs?: number | null };
+            const is429 = error?.status === 429 || /^429\s*[-:]/.test(String(error?.message || ''));
+            if (!is429 || params?.signal?.aborted || signal?.aborted) throw caught;
+            speedFix429Count++;
+            speedFix429Streak++;
+            speedFixLast429 = Date.now();
+            speedFixSuccessesAfter429 = 0;
+            const fallbackMs = Math.min(60000, 5000 * (2 ** Math.min(speedFix429Streak - 1, 4)));
+            const serverMs = typeof error.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs) ? Math.max(0, error.retryAfterMs) : 0;
+            const waitMs = Math.max(fallbackMs, serverMs);
+            speedFixCooldownUntil = Math.max(speedFixCooldownUntil, Date.now() + waitMs);
+            speedFixGap = Math.min(150, speedFixBaseGap + 25 * speedFix429Streak);
+            await speedFixPreparationLimiter.updateSettings({ minTime: speedFixGap });
+            const willRetry = attempt < max429Retries;
+            this.log('warn', `${SPEEDFIX_LABEL} HEAD 429: cooldown ${Math.ceil(waitMs / 1000)}s; HEAD gap ${speedFixGap} ms; attempt ${attempt + 1}/${max429Retries + 1}; retry=${willRetry}`);
+            if (!willRetry) throw caught;
+          }
+        }
+        throw new Error('HEAD preparation retries exhausted');
+      };
+      let speedFixSlowest: { id: string | number; ms: number } | null = null;
+      try {
+        await Promise.all(Array.from({ length: Math.min(speedFixWorkers, target.length) }, async () => {
+          while (!signal?.aborted) {
+            const index = speedFixNextIndex++;
+            if (index >= target.length) return;
+            const tt = target[index];
+            const started = Date.now();
+            try {
+              const tasks = await DownloadTaskFactory.createFromDownloadable({
+                config: this.config,
+                dirs,
+                item: tt,
+                src,
+                fetcher: this.fetcher,
+                fileExistsAction: task.fileExistsAction,
+                isAttachment: task.isAttachment,
+                limiter: speedFixPreparationLimiter,
+                signal,
+                logger: this.logger
+              });
+              speedFixResults[index] = { tt, tasks, ms: Date.now() - started };
+            }
+            catch (error) {
+              speedFixResults[index] = { tt, error, ms: Date.now() - started };
+            }
+          }
+        }));
+      }
+      finally {
+        if (speedFixHadOwnResolver) (this.fetcher as any).resolveDestFilePath = speedFixOriginalResolver;
+        else delete (this.fetcher as any).resolveDestFilePath;
+      }
+      const ensureDirsSet = new Set<string>();
+      for (const result of speedFixResults) {
+        if (signal?.aborted) return { batch, errorCount: failedCreateTaskCount };
+        if (!result) continue;
+        const { tt, tasks, error, ms } = result;
+        if (!speedFixSlowest || ms > speedFixSlowest.ms) speedFixSlowest = { id: tt.id, ms };
+        try {
+          if (error) throw error;
+          if (!tasks) throw new Error('No download tasks returned');
+          for (const createdTask of tasks) {
+            if (createdTask.doa) {
+              this.log('error', `Failed to create download task for item #${tt.id} in ${targetName}:`, createdTask.doa.msg, createdTask.doa.cause);
               failedCreateTaskCount++;
             }
           }
-          const createdTasks = tasks.filter((task) => !task.doa);
+          const createdTasks = tasks.filter((createdTask) => !createdTask.doa);
           batch.addTasks(createdTasks);
-          ensureDirs = createdTasks.reduce<string[]>((result, task) => {
-            const dir = task.resolvedDestPath ? path.dirname(task.resolvedDestPath) : null;
-            if (dir && !result.includes(dir)) {
-              result.push(dir);
-            }
-            return result;
-          }, ensureDirs);
+          for (const createdTask of createdTasks) {
+            const dir = createdTask.resolvedDestPath ? path.dirname(createdTask.resolvedDestPath) : null;
+            if (dir) ensureDirsSet.add(dir);
+          }
         }
         catch (error) {
           if (signal?.aborted) {
@@ -253,7 +415,11 @@ export default abstract class Downloader<T extends DownloaderType> extends Event
           }
         }
       }
-      for (const dir of ensureDirs) {
+      const speedFixHeadCacheAfter = this.fetcher.__speedFixV231HeadMetrics;
+      this.log('info', `${SPEEDFIX_LABEL} HEAD cache: ${speedFixHeadCacheAfter.hits - speedFixHeadCacheBefore.hits} reused; ${speedFixHeadCacheAfter.misses - speedFixHeadCacheBefore.misses} requests (exact URL, 20s TTL)`);
+      this.log('info', `${SPEEDFIX_LABEL} Prepared ${target.length} item(s) for ${targetName} in ${Date.now() - speedFixStart} ms (up to ${speedFixWorkers} concurrent; HEAD gap ${speedFixBaseGap} -> ${speedFixGap} ms; HEAD attempts ${speedFixHeadAttempts}; HTTP 429s ${speedFix429Count}${speedFixSlowestHead ? `; slowest HEAD ${(speedFixSlowestHead as { ms: number }).ms} ms` : ''}${speedFixSlowest ? `; slowest item #${(speedFixSlowest as { id: string | number; ms: number }).id}: ${(speedFixSlowest as { ms: number }).ms} ms` : ''})`);
+      // === End SpeedFix v2.4.2 preparation ===
+      for (const dir of ensureDirsSet) {
         this.fsHelper.createDir(dir);
       }
     }

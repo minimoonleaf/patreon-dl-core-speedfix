@@ -1,6 +1,6 @@
 {
   "name": "patreon-dl",
-  "version": "3.9.0",
+  "version": "3.9.0-speedfix.255",
   "description": "Patreon Downloader",
   "type": "module",
   "exports": "./dist/index.js",
@@ -139,5 +139,8 @@
     "patreon",
     "download",
     "downloader"
-  ]
+  ],
+  "allowScripts": {
+    "esbuild@0.25.5": true
+  }
 }
