@@ -1,123 +1,162 @@
 <!-- SPEEDFIX-FORK-INTRO-BEGIN -->
 # Patreon Downloader Core — SpeedFix
 
-**Download and organize Patreon content you have access to — with less waiting during large or repeated downloads.**
+Download and organize Patreon content you can access, with less overhead when processing large archives or scanning previously downloaded posts.
 
-**SpeedFix v2.5.5 · Core `3.9.0-speedfix.255` · Node.js CLI / library · Unofficial community fork**
+Version: SpeedFix v2.5.5 · Core package `3.9.0-speedfix.255` · Node.js CLI / library · Community-maintained fork
 
-[**Windows GUI & MSI installer**](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases) · [**GUI source**](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix) · [**Core releases / tags**](https://github.com/minimoonleaf/patreon-dl-core-speedfix/tags) · [**Original project**](https://github.com/patrickkfkan/patreon-dl)
+[Windows GUI / MSI installer](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases) · [SpeedFix GUI source](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix) · [Core tags](https://github.com/minimoonleaf/patreon-dl-core-speedfix/tags) · [Original Core](https://github.com/patrickkfkan/patreon-dl)
 
-## What is Patreon Downloader?
+## English
 
-[Patreon](https://www.patreon.com/) is a platform where creators publish posts and share media with their audiences. **Patreon Downloader** is an open-source tool originally developed by Patrick Kan that helps you save and organize Patreon content available to your account, so you can maintain a local copy of posts and their media.
+### 1. What is Patreon Downloader?
 
-Depending on the content and your access permissions, it can download:
+Patreon Downloader is an open-source tool created by Patrick Kan for downloading and organizing Patreon content that your account is already permitted to access. It helps preserve local copies of creator posts and associated media, subject to their availability and your access rights.
 
-- Creator posts, individual posts, and collections.
-- Images, audio, attachments, and supported videos / embedded media.
-- Purchased shop products and associated content.
-- Post and creator information, with options to organize downloaded files and browse them locally.
+Supported content includes creator and individual posts, collections, images, audio, attachments, supported videos, and purchased shop content. The Core provides a Node.js command-line tool and reusable library. For a Windows graphical application, use the companion [cw3 + SpeedFix GUI](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases).
 
-The **Core** is the Node.js command-line downloader and reusable library. If you prefer a graphical interface, use the matching **[cw3 + SpeedFix GUI for Windows](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases)** instead.
+The downloader does not unlock unsubscribed content or bypass DRM.
 
-**Access and limitations:** This tool uses access you already have (for example, through your Patreon account cookie). It does not grant access to posts you have not subscribed to or purchased, and it does not bypass DRM. See the original feature, dependency, and limitation documentation below.
+### 2. Why SpeedFix?
 
-## Why does SpeedFix exist?
+The original downloader provides extensive features, but processing a large creator archive or running the same download job again may require many individual post refreshes, metadata checks, and file-preparation steps. Some of that work is unnecessary when posts are already downloaded and the available metadata confirms that nothing relevant has changed.
 
-The original downloader already supports many content types and useful configuration options. However, **large creator archives and repeat downloads** can spend substantial time checking posts, requesting media metadata, and preparing download tasks—even when much of the content has not changed.
+SpeedFix focuses on reducing this repeated work without simply raising media transfer limits:
 
-SpeedFix was created to reduce that avoidable overhead while retaining the original downloader's behavior and respecting Patreon API rate limits. Its goals are to:
+1. Skip unnecessary individual post refreshes when status-cache validation is safe.
+2. Prepare media tasks with controlled parallelism.
+3. Reuse recent HEAD responses and handle HTTP 429 rate limits.
+4. Reduce duplicate destination-path scanning overhead.
+5. Expose timing and skip statistics for troubleshooting.
 
-1. **Avoid unnecessary work** when existing cache and fresh listing metadata safely indicate that a post can be skipped.
-2. **Prepare downloads more efficiently** through limited concurrency and smarter metadata requests.
-3. **Handle temporary rate limits more gracefully**, rather than simply making requests as fast as possible.
-4. **Make performance observable** with clearer timing, skip statistics, and diagnostic logs.
+### 3. Performance comparison with original Core v3.9.0
 
-This project is **not** a bandwidth-unlocking tool. Its main improvements target content discovery, validation, metadata requests, and download preparation; actual media-transfer speed still depends on the network and server.
+The table compares identifiable operations in the original source and SpeedFix. It does not claim that total download time improves by the same percentages.
 
-## What's improved in SpeedFix v2.5.5?
+| Optimization | Original Core v3.9.0 | SpeedFix v2.5.5 | Quantified difference |
+|---|---|---|---|
+| Individual post refreshes for 360 eligible, unchanged posts | The original bulk-post flow refreshes each post before status-cache validation: 360 requests under these conditions | In a reported v2.5.4 run, 360/360 posts qualified for Fast Skip, so these individual refreshes were avoided | 360 → 0 requests; 100% fewer individual refreshes for this specific sample |
+| Media task preparation | One item is awaited at a time | Up to 4 preparation workers, limited by the configured concurrency | Up to 4× as many simultaneous preparation workers (+300% concurrency capacity); not a measured 4× speedup |
+| Repeated HEAD requests for an identical URL | No corresponding short-lived HEAD response cache; 10 qualifying lookups can result in 10 requests | One successful response can be reused for subsequent matching lookups within 20 seconds (cache capacity: 64 entries) | Example: 10 → 1 requests, a 90% reduction; conditional illustration, not a benchmark |
+| Destination-path collision checks | Repeated scans of the task list | Indexed groups using a `Map` | Reduces repeated scan work; no verified runtime percentage yet |
 
-| Area | Changes |
+#### Additional improvement within the SpeedFix series
+
+| HEAD preparation pacing | Earlier SpeedFix setting | Current setting | Calculated change |
+|---|---|---|---|
+| Minimum request-start interval | 75 ms | 60 ms | 20% shorter interval; approximately 25% higher theoretical initiation rate when pacing is the sole bottleneck |
+
+The 75 ms → 60 ms figure compares two SpeedFix revisions, not the original Core: upstream v3.9.0 did not have this separate HEAD preparation pacing setting.
+
+#### How to interpret these figures
+
+- The 360/360 figure comes from an earlier v2.5.4 cache-heavy run; the Fast Skip functionality remains in v2.5.5. It describes requests avoided for those eligible posts, not a 100% reduction in all API requests or total runtime.
+- Parallel worker count measures available concurrency, not a proven wall-clock speedup. Network latency, request pacing, file I/O, and rate limits may reduce the benefit.
+- The 90% HEAD example assumes ten identical eligible HEAD lookups within the cache lifetime, with a reusable successful response.
+- There is currently no controlled, repeatable end-to-end benchmark proving a fixed overall download-speed percentage versus upstream v3.9.0. Media GET rate limiting is not intentionally increased.
+
+### 4. Other SpeedFix improvements
+
+| Feature | Details |
 |---|---|
-| **Fast Skip** | Skips unnecessary per-post refresh requests when existing status-cache checks and available fresh listing metadata meet the required conditions. Changes that are not reflected in this metadata might not be detected. |
-| **Parallel preparation** | Supports up to **4 concurrent download-preparation workers**, subject to configured concurrency. |
-| **HEAD request optimization** | Uses a default **60 ms** preparation gap and a **20-second cache** with up to **64 entries**, reducing repeated requests. `SPEEDFIX_HEAD_GAP_MS` can adjust the interval within its supported range. |
-| **HTTP 429 handling** | Uses `Retry-After` when supplied, bounded retries, and adaptive cooldown for rate-limited HEAD requests. |
-| **Destination handling** | Reduces overhead when checking for duplicate output paths. |
-| **Diagnostics** | Adds Fast Skip statistics, preparation timing, slow-task information, and batch-level performance logs. |
+| Fast Skip safety checks | Requires matching status-cache validation and usable list metadata; posts that do not qualify use the normal refresh flow. |
+| HEAD cache | 20-second lifetime, maximum 64 entries. |
+| HEAD pacing | Default 60 ms; configurable through `SPEEDFIX_HEAD_GAP_MS` (50–150 ms). |
+| HTTP 429 handling | Observes `Retry-After` where supplied, bounded retries, and adaptive cooldown. |
+| Batch diagnostics | Reports preparation time, slow tasks, Fast Skip totals, and collision-scan timing. |
 
-### How much faster is it?
+### 5. Download and installation
 
-SpeedFix improves specific stages of the workflow, but **there is not yet a reproducible end-to-end benchmark showing a fixed overall speedup** over the original Core v3.9.0.
+- Windows desktop users: download the MSI from the [GUI Releases page](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases). The packaged GUI includes its required Core.
+- CLI users and developers: use this repository's `speedfix` branch, or the [`v2.5.5-speedfix` source tag](https://github.com/minimoonleaf/patreon-dl-core-speedfix/tree/v2.5.5-speedfix). See “Installation (SpeedFix fork)” further down this README.
+- GUI source builders: build this Core, create `patreon-dl-3.9.0-speedfix.255.tgz` using `npm pack`, and place it in the GUI repository's `vendor` directory before installing GUI dependencies.
 
-For perspective, comparing a **75 ms** request-preparation interval with **60 ms** gives a **20% shorter interval** and approximately **25% higher theoretical request-initiation frequency** *if request pacing is the only bottleneck*. This is a configuration-level comparison, **not a measured 25% improvement in total download speed**. With many unchanged posts, Fast Skip can avoid numerous API calls; when downloading large new videos, network transfer time may dominate instead.
-
-Performance varies with the number of posts, cache hit rate, available metadata, network latency, and server rate limits. Media GET rate limiting is **not intentionally increased**.
-
-## Which version should I use?
-
-- **Windows users:** Download the installer from the [GUI Releases page](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases). You do not need to install the Core separately when using the packaged GUI.
-- **CLI users / developers:** Use this Core repository. The `speedfix` branch is maintained for ongoing development, while [`v2.5.5-speedfix`](https://github.com/minimoonleaf/patreon-dl-core-speedfix/tree/v2.5.5-speedfix) identifies this release's source.
-- **Building the GUI yourself:** The matching GUI depends on the locally packaged Core `patreon-dl-3.9.0-speedfix.255.tgz`. Build this Core, run `npm pack`, and place the tarball in the GUI's `vendor` folder as described in the GUI README.
-
-**Installation warning:** `npm i -g patreon-dl` downloads the standard npm registry package, **not this SpeedFix fork**. Follow the **Installation (SpeedFix fork)** instructions below to build this version from source.
+Note: `npm i -g patreon-dl` installs the standard npm registry release, not this SpeedFix fork.
 
 ---
 
-## 繁體中文｜專案介紹
+## 繁體中文
 
-### Patreon Downloader 是什麼？
+### 1. Patreon Downloader 是什麼？
 
-[Patreon](https://www.patreon.com/) 是創作者發布貼文、圖片、影片、音訊及會員內容的平台。**Patreon Downloader** 是 Patrick Kan 開發的開源下載工具，可以將你**原本就有權限存取**的 Patreon 貼文與媒體保存到本機，方便整理、備份與瀏覽。
+Patreon Downloader 是由 Patrick Kan 開發的開源工具，用來下載並整理帳號原本就有權限存取的 Patreon 內容，方便保存創作者貼文與相關媒體的本機副本。
 
-它支援依創作者、單篇貼文、收藏集及已購買商品下載內容，依內容類型與權限處理圖片、音訊、附件及支援的影片，並保存相關資訊。
+依內容與存取權限，可處理創作者與單篇貼文、收藏集、圖片、音訊、附件、支援的影片以及已購買的商店內容。本儲存庫提供 Node.js 命令列工具與程式庫；希望使用 Windows 圖形介面者，請下載 [cw3 + SpeedFix GUI](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases)。
 
-這個 Repository 是 **Core 核心程式**，提供 Node.js 命令列工具及程式庫。如果你只想在 Windows 使用圖形介面，建議直接下載 **[cw3 + SpeedFix GUI 安裝版](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases)**，不需要另外手動安裝 Core。
+本工具不會解鎖未訂閱內容，也不能繞過 DRM。
 
-**使用限制：** 本工具只能取得帳號本來就有權限瀏覽的內容，不會解鎖未訂閱或未購買的貼文，也不能繞過 DRM 保護。
+### 2. 為什麼開發 SpeedFix？
 
-### 為什麼開發 SpeedFix？
+原版功能完整，但在掃描大量創作者貼文、或重複執行已下載過的工作時，仍可能花費時間逐篇重新請求貼文、查詢媒體資訊、準備下載任務。當快取和最新列表資訊已能確認部分內容未變更時，這些處理就可能成為可避免的負擔。
 
-原版 Patreon Downloader 已有完整的下載及設定功能，但在**大量貼文、重複掃描或已下載過大部分內容**的情境下，程式可能仍需花費不少時間檢查貼文、查詢媒體資訊、準備下載任務，即使其中許多貼文根本沒有更新。
+SpeedFix 的重點是降低重複工作，而不是直接提高媒體下載連線限制：
 
-SpeedFix 的目的不是無限制增加下載連線，而是**減少不必要的 API 請求與等待，改善下載準備效率，同時維持原有功能並妥善處理 Patreon 的速率限制**。
+1. 安全符合條件時，省略不必要的逐篇貼文刷新請求。
+2. 使用受限制的並行 Worker 加快媒體任務準備。
+3. 快取近期 HEAD 回應並改善 HTTP 429 流量限制處理。
+4. 減少輸出路徑衝突檢查的重複掃描。
+5. 加入耗時與跳過統計，方便評估效果與排查問題。
 
-### SpeedFix v2.5.5 改善了什麼？
+### 3. 與官方原版 Core v3.9.0 的效能比較
 
-- **Fast Skip：** 在狀態快取與最新列表資料符合條件時，省略未變更貼文不必要的逐篇重新請求；若遠端變更沒有反映在可取得的資料中，仍可能無法偵測。
-- **並行準備：** 最多使用 **4 個 Worker** 準備下載任務，降低等待。
-- **HEAD 最佳化：** 預設 **60 ms** 準備間隔、**20 秒**快取及最多 **64 筆**快取項目，減少重複請求。
-- **HTTP 429 保護：** 透過 `Retry-After`、有限次數重試與自適應冷卻，更穩定地處理暫時的速率限制。
-- **檔案與日誌：** 改善輸出路徑重複檢查效率，並提供 Fast Skip 統計、任務準備耗時、慢速任務及批次效能資訊。
+下表的百分比是特定操作的請求數或理論並行能力，不代表整體下載時間有相同比例的加速。
 
-### 大約可以快多少？
+| 最佳化項目 | 官方原版 Core v3.9.0 | SpeedFix v2.5.5 | 量化差異 |
+|---|---|---|---|
+| 360 篇符合條件、未變更貼文的逐篇刷新 | 原版大量貼文流程會先逐篇刷新再驗證快取；依該條件會有 360 次請求 | 先前 v2.5.4 測試紀錄顯示 360/360 篇符合 Fast Skip，省略這些逐篇刷新 | 360 → 0 次，該樣本的逐篇刷新請求減少 100% |
+| 媒體任務準備 | 逐項等待完成後處理下一項 | 最多 4 個準備 Worker，受並行設定限制 | 同時處理容量最高為原版 4 倍（+300%），不是實測快 4 倍 |
+| 相同 URL 的重複 HEAD | 無對應的短期 HEAD 回應快取；符合條件時查詢 10 次可能發出 10 次請求 | 成功回應在 20 秒內可重用；快取上限 64 筆 | 範例：10 → 1 次，減少 90%；屬情境推算 |
+| 輸出檔名路徑衝突 | 重複掃描任務清單 | 以 `Map` 建立路徑索引分組 | 降低重複掃描量，尚無可靠的實測耗時百分比 |
 
-目前**尚無可重現的原版 Core 3.9.0 與 SpeedFix v2.5.5 完整下載時間對照測試**，因此不宣稱固定加速 2 倍、3 倍或某個百分比。
+#### SpeedFix 版本內部的額外改善
 
-以設定差異舉例：將請求準備間隔由 **75 ms 調為 60 ms**，代表間隔縮短 **20%**；如果唯一瓶頸就是這個間隔，理論請求發起頻率約可提高 **25%**。**這不是整體下載速度提升 25% 的實測結果。**
+| HEAD 準備節奏 | SpeedFix 早期設定 | 目前設定 | 計算結果 |
+|---|---|---|---|
+| 最小請求啟動間隔 | 75 ms | 60 ms | 間隔縮短 20%；若只有節奏限制是瓶頸，理論啟動頻率約提高 25% |
 
-實際效果取決於貼文是否有變更、快取命中率、API 回應速度、網路品質及媒體大小。重複掃描大量未變更貼文通常更能受益；下載大型新影片時，則可能主要受到網路速度限制。SpeedFix 並未刻意提高媒體 GET 的速率限制。
+75 ms → 60 ms 是 SpeedFix 不同版本之間的調整，並非官方原版與 SpeedFix 的對照；官方原版沒有這套獨立 HEAD 準備節奏設定。
 
-### 如何取得與安裝？
+#### 數據的適用範圍
 
-- **Windows 一般使用者：** 到 [GUI Releases](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases) 下載 MSI 安裝程式。
-- **命令列與開發者：** 使用本 Core Fork 的 `speedfix` 分支；正式版本以 [`v2.5.5-speedfix` Tag](https://github.com/minimoonleaf/patreon-dl-core-speedfix/tree/v2.5.5-speedfix) 標記。
-- **自行編譯 GUI：** 必須先建置本 Core 並使用 `npm pack` 產生 `patreon-dl-3.9.0-speedfix.255.tgz`，放入 GUI 專案的 `vendor` 目錄。
+- 360/360 是先前 v2.5.4 高快取命中率案例；v2.5.5 保留 Fast Skip 功能。減少 100% 指該樣本可省略的逐篇刷新請求，不是所有 API 請求，也不是總下載時間。
+- Worker 數量代表並行容量，不等於實測加速倍數；網路、HEAD 節奏、磁碟 I/O 與伺服器流量限制都可能影響效果。
+- HEAD 減少 90% 是假設同一 URL 在 20 秒內發生 10 次符合快取條件的查詢所得的計算範例。
+- 目前還沒有與官方 Core v3.9.0 在相同條件下、可重現的完整下載耗時 Benchmark，因此不宣稱整體下載固定快了多少％。媒體 GET 的速率限制也沒有刻意提高。
 
-提醒：直接執行 `npm i -g patreon-dl` 安裝的是 npm 上的**一般原版**，不是這個 SpeedFix Fork。請依照下方的 **Installation (SpeedFix fork)** 說明安裝。
+### 4. SpeedFix 其他改進
+
+| 功能 | 說明 |
+|---|---|
+| Fast Skip 安全驗證 | 必須同時符合狀態快取與列表資訊要求；不符合者沿用原本刷新流程。 |
+| HEAD 快取 | 保存 20 秒，最多 64 筆。 |
+| HEAD 節奏 | 預設 60 ms；可用 `SPEEDFIX_HEAD_GAP_MS` 設為 50–150 ms。 |
+| HTTP 429 防護 | 參考 `Retry-After`、有限次數重試及自適應冷卻。 |
+| 效能日誌 | 記錄準備耗時、慢速任務、Fast Skip 數量及路徑衝突處理時間。 |
+
+### 5. 下載與安裝
+
+- Windows 使用者：直接到 [GUI Releases](https://github.com/minimoonleaf/patreon-dl-gui-cw3-speedfix/releases) 下載 MSI；安裝版已包含配套 Core。
+- 命令列使用者或開發者：使用本儲存庫的 `speedfix` 分支或 [`v2.5.5-speedfix` 原始碼標記](https://github.com/minimoonleaf/patreon-dl-core-speedfix/tree/v2.5.5-speedfix)，並參考下方的「Installation (SpeedFix fork)」教學。
+- 自行編譯 GUI：先建置 Core 並用 `npm pack` 產生 `patreon-dl-3.9.0-speedfix.255.tgz`，放入 GUI 的 `vendor` 資料夾後再安裝 GUI 相依套件。
+
+提醒：直接執行 `npm i -g patreon-dl` 取得的是 npm 套件庫中的一般版本，不是 SpeedFix Fork。
+
+---
 
 ## Credits & License / 作者與授權
 
-- **Original Patreon Downloader / 原始核心作者：** [Patrick Kan (@patrickkfkan)](https://github.com/patrickkfkan/patreon-dl).
-- **cw3 GUI improvements / cw3 介面修改：** [Moe Haduki (@hadukimoe)](https://github.com/patrickkfkan/patreon-dl-gui/issues/85).
-- **SpeedFix integration & maintenance / SpeedFix 整合維護：** [minimoonleaf](https://github.com/minimoonleaf).
-- The original project's MIT license, copyright notices, `LICENSE`, `NOTICE`, and third-party attributions remain in effect. / 原專案 MIT 授權、著作權宣告與第三方致謝仍須保留。
+| Contribution / 貢獻 | Maintainer / 維護者 |
+|---|---|
+| Original Patreon Downloader Core / 原始核心 | [Patrick Kan (@patrickkfkan)](https://github.com/patrickkfkan/patreon-dl) |
+| cw3 GUI modifications / cw3 介面修改 | [Moe Haduki (@hadukimoe)](https://github.com/patrickkfkan/patreon-dl-gui/issues/85) |
+| SpeedFix changes & maintenance / SpeedFix 修改及維護 | [minimoonleaf](https://github.com/minimoonleaf) |
 
-**This is an unofficial community-maintained fork**, not an official release by the original maintainers. / **本專案為非官方社群維護版本**。
+This is an unofficial community-maintained fork, not an official release from the original maintainers. The original MIT license, copyright statements, `LICENSE`, `NOTICE`, and third-party attributions remain applicable.
 
-The sections below preserve the original project's detailed features, CLI options, configuration, limitations, and changelog with fork-specific installation adjustments.
+本專案為非官方社群維護版本。原專案的 MIT 授權、著作權宣告、`LICENSE`、`NOTICE` 與第三方致謝仍須保留。
+
+The original project's detailed CLI, configuration, features, limitations, and changelog continue below. / 以下保留原版的 CLI、設定、功能、限制與版本歷史文件。
 <!-- SPEEDFIX-FORK-INTRO-END -->
-
 
 <a href='https://ko-fi.com/minimoonleaf' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi2.png?v=3' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
